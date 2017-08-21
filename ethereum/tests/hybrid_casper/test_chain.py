@@ -6,6 +6,7 @@ from ethereum.db import EphemDB
 from ethereum.hybrid_casper import casper_utils
 from ethereum.hybrid_casper.casper_utils import mk_prepare, mk_commit
 from ethereum.slogging import get_logger
+log = get_logger('test.chain')
 logger = get_logger()
 
 _db = new_db()
@@ -324,10 +325,14 @@ def test_head_change_for_more_commits_on_parent_fork(db):
     casper.commit(mk_commit(1, 7, epoch_blockhash(t, 7), 3, keys[1]))
     t.mine()
     casper.commit(mk_commit(2, 7, epoch_blockhash(t, 7), 3, keys[2]))
-    t.mine()
+    chain2_longest = t.mine()
     assert t.chain.head_hash == chain0.hash
     # 7A_1: Add one more commit on a fork which will now be enough to change the head
     t.change_head(chain2_7A.hash)
     casper.commit(mk_commit(3, 7, epoch_blockhash(t, 7), 3, keys[3]))
+    t.mine(number_of_blocks=2)
+    # We now choose the longest chain considering all known commits, which happens to be chain2
+    assert t.chain.head_hash == chain2_longest.hash
     chain3 = t.mine()
+    # We just mined one more block, and so we now switch to chain3
     assert t.chain.head_hash == chain3.hash

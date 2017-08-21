@@ -6,39 +6,34 @@ from ethereum import utils
 from ethereum.utils import parse_as_bin, big_endian_to_int
 from ethereum.meta import apply_block
 from ethereum.common import update_block_env_variables
-from ethereum.messages import apply_transaction
-from ethereum import transactions
-from ethereum.hybrid_casper import casper_utils
-from ethereum.tools import tester
 import rlp
 from rlp.utils import encode_hex
-from ethereum.exceptions import InvalidNonce, InsufficientStartGas, UnsignedTransaction, \
-    BlockGasLimitReached, InsufficientBalance, InvalidTransaction, VerificationFailed
-from ethereum.slogging import get_logger, configure_logging
+from ethereum.exceptions import InvalidTransaction, VerificationFailed
+from ethereum.slogging import get_logger
 from ethereum.config import Env
 from ethereum.state import State, dict_to_prev_header
 from ethereum.block import Block, BlockHeader, BLANK_UNCLES_HASH
 from ethereum.pow.consensus import initialize
-from ethereum.genesis_helpers import mk_basic_state, state_from_genesis_declaration, \
-        initialize_genesis_keys
+from ethereum.genesis_helpers import mk_basic_state, state_from_genesis_declaration, initialize_genesis_keys
 
 
 log = get_logger('eth.chain')
 config_string = ':info,eth.chain:debug'
+# from ethereum.slogging import configure_logging
 # config_string = ':info,eth.vm.log:trace,eth.vm.op:trace,eth.vm.stack:trace,eth.vm.exit:trace,eth.pb.msg:trace,eth.pb.tx:debug'
 # configure_logging(config_string=config_string)
 
 
 class Chain(object):
 
-    def __init__(self, genesis=None, env=None, coinbase=b'\x00' * 20, \
+    def __init__(self, genesis=None, env=None, coinbase=b'\x00' * 20,
                  new_head_cb=None, reset_genesis=False, localtime=None, **kwargs):
         self.env = env or Env()
         # Initialize the state
         if 'head_hash' in self.db:  # new head tag
             self.state = self.mk_poststate_of_blockhash(self.db.get('head_hash'))
-            print('Initializing chain from saved head, #%d (%s)' % \
-                (self.state.prev_headers[0].number, encode_hex(self.state.prev_headers[0].hash)))
+            print('Initializing chain from saved head, #%d (%s)' %
+                  (self.state.prev_headers[0].number, encode_hex(self.state.prev_headers[0].hash)))
         elif genesis is None:
             raise Exception("Need genesis decl!")
         elif isinstance(genesis, State):
@@ -54,8 +49,8 @@ class Chain(object):
         elif "prev_headers" in genesis:
             self.state = State.from_snapshot(genesis, self.env)
             reset_genesis = True
-            print('Initializing chain from provided state snapshot, %d (%s)' % \
-                (self.state.block_number, encode_hex(self.state.prev_headers[0].hash[:8])))
+            print('Initializing chain from provided state snapshot, %d (%s)' %
+                  (self.state.block_number, encode_hex(self.state.prev_headers[0].hash[:8])))
         else:
             print('Initializing chain from new state based on alloc')
             self.state = mk_basic_state(genesis, {
@@ -76,8 +71,9 @@ class Chain(object):
 
         self.head_hash = self.state.prev_headers[0].hash
         self.checkpoint_head_hash = b'\x00' * 32
+        self.db.put(b'cp_subtree_score' + b'\x00' * 32, 2/3.)
         self.commit_logs = []
-        self.casper_address = self.env.config['CASPER_ADDRESS']
+        self.casper_address = self.config['CASPER_ADDRESS']
         self.db.put('GENESIS_NUMBER', str(self.state.block_number))
         assert self.state.block_number == self.state.prev_headers[0].number
         if reset_genesis:
@@ -85,6 +81,7 @@ class Chain(object):
             initialize_genesis_keys(self.state, self.genesis)
         else:
             self.genesis = self.get_block_by_number(0)
+        self.db.put(b'cp_subtree_score' + self.genesis.hash, 2/3.)
         self.min_gasprice = kwargs.get('min_gasprice', 5 * 10**9)
         self.coinbase = coinbase
         self.extra_data = 'moo ha ha says the laughing cow.'
@@ -104,41 +101,294 @@ class Chain(object):
             log.error(e)
             return None
 
-    # Casper fork choice outline:
-    # TODO
+    @property
+    def head_checkpoint(self):
+        checkpoint = self.get_block(self.checkpoint_head_hash)
+        if checkpoint is None:
+            return self.genesis
+        return checkpoint
 
-    def casper_log_handler(self, contract_log, fork_state, blockhash):
-        # We only want logs from the Casper contract
-        if contract_log.address != self.casper_address:
+    # ~~~~~~~~~~~~~~~~~~~~ CASPER ~~~~~~~~~~~~~~~~~~~~ #
+    def casper_log_handler(self, contract_log, blockhash):
+        # Return if it's not a log from the Casper address or if it's not a commit log
+        if (contract_log.address != self.casper_address or
+                contract_log.topics[0] != utils.bytearray_to_int(utils.sha3("commit()"))):
             return
-        # Check to see if it is a prepare or a commit
-        if contract_log.topics[0] == utils.bytearray_to_int(utils.sha3("prepare()")):
-            log.info('Recieved prepare')
-        elif contract_log.topics[0] == utils.bytearray_to_int(utils.sha3("commit()")):
-            self.commit_logs.append(contract_log.data)
-            # Wait until we have all three commit events before processing the commit
-            if len(self.commit_logs) != 3:
-                # If we don't have all three, return.
-                return
-            log.info('Recieved commit')
-            # Extract the raw commit RLP, total deposits for the dynasty, and this validator's deposits
-            raw_commit, total_deposits, validator_deposits = self.commit_logs.pop(0), self.commit_logs.pop(0), self.commit_logs.pop(0)
-            commit = self.get_decoded_commit(raw_commit)
-            checkpoint_hash = commit['hash']
-            # Store the total deposits for this checkpoint if we haven't already
-            if b'cp_total_deposits:' + checkpoint_hash not in self.db:
-                self.db.put(b'cp_total_deposits:' + checkpoint_hash, total_deposits)
-            # Store this validator's deposit for this checkpoint
-            try:
-                deposits = self.db.get(b'cp_deposits:' + checkpoint_hash)
-            except KeyError:
-                deposits = dict()
-            if commit['validator_index'] in deposits:
-                log.info('Validator deposit already stored!')
-            deposits[commit['validator_index']] = validator_deposits
-            self.db.put(b'cp_deposits:' + checkpoint_hash, deposits)
-            # Update the checkpoint_head_hash if needed
-            self.maybe_update_checkpoint_head_hash(commit['hash'])
+        self.commit_logs.append(contract_log.data)
+        # Wait until we have all three commit events before processing the commit
+        if len(self.commit_logs) != 3:
+            # If we don't have all three, return.
+            return
+        log.info('Recieved commit')
+        # Extract the raw commit RLP, total deposits for the dynasty, and this validator's deposits
+        raw_commit, total_deposits, validator_deposits = self.commit_logs.pop(0), self.commit_logs.pop(0), self.commit_logs.pop(0)
+        commit = self.get_decoded_commit(raw_commit)
+        self.store_commit(commit, total_deposits, validator_deposits)
+        # Update the checkpoint's `subtree_score` & `child_pointer` which are effected by the new commit score
+        self.update_subtree_scores_and_child_pointers(commit['hash'])
+        # Try to update the head, in case the new commit justifies a reorg
+        self.recompute_head_checkpoint(self.get_block(commit['hash']))
+
+    def update_subtree_scores_and_child_pointers(self, checkpoint_hash):
+        if b'cp_total_deposits:' + checkpoint_hash not in self.db:
+            raise Exception('No deposits found for chekcpoint hash: {}'.format(utils.encode_hex(checkpoint_hash)))
+        new_cp_score = self.get_checkpoint_score(checkpoint_hash)
+        if new_cp_score <= self.get_subtree_score(checkpoint_hash):
+            log.info('*** block num: {} - new cp score: {} - subtree score: {} '.format(self.get_block(checkpoint_hash).number, new_cp_score, self.get_subtree_score(checkpoint_hash)))
+            return
+        cp_iterator = checkpoint_hash
+        log.info('*** Updating subtree scores. cp_iterator num: {} - cp_iterator score: {}'.format(self.get_block(cp_iterator).number, self.get_subtree_score(cp_iterator)))
+        while cp_iterator is not None and self.get_subtree_score(cp_iterator) < new_cp_score:
+            log.info('*** cp_iterator: {}'.format(self.get_block(cp_iterator).number))
+            self.db.put(b'cp_subtree_score' + cp_iterator, new_cp_score)
+            parent_iterator = self.get_prev_checkpoint_hash(cp_iterator)
+            if self.get_child_cp(parent_iterator) is not None:
+                log.info('*** parent num: {} - parent score: {}'.format(self.get_child_cp(parent_iterator), self.get_subtree_score(self.get_child_cp(parent_iterator))))
+            if self.get_child_cp(parent_iterator) is None or self.get_subtree_score(self.get_child_cp(parent_iterator)) < new_cp_score:
+                log.info('***Putting child of block {} with block num: {}'.format(self.get_block(parent_iterator).number, self.get_block(cp_iterator).number))
+                self.db.put(b'cp_child' + parent_iterator, cp_iterator)
+            cp_iterator = parent_iterator
+        return True
+
+    def get_subtree_score(self, checkpoint_hash):
+        return self.db.get(b'cp_subtree_score' + checkpoint_hash)
+
+    def store_commit(self, commit, total_deposits, validator_deposits):
+        checkpoint_hash = commit['hash']
+        # Store the total deposits for this checkpoint if we haven't already
+        if b'cp_total_deposits:' + checkpoint_hash not in self.db:
+            self.db.put(b'cp_total_deposits:' + checkpoint_hash, total_deposits)
+        # Store this validator's deposit for this checkpoint
+        try:
+            deposits = self.db.get(b'cp_deposits:' + checkpoint_hash)
+        except KeyError:
+            deposits = dict()
+        if commit['validator_index'] in deposits:
+            log.info('Validator deposit already stored!')
+        deposits[commit['validator_index']] = validator_deposits
+        self.db.put(b'cp_deposits:' + checkpoint_hash, deposits)
+
+    def get_score(self, block):
+        if not self.is_checkpoint(block):
+            raise Exception("Baaad")
+        cp_score = self.get_checkpoint_score(block.hash) * 10000000000000000000
+        block = self.get_pow_head(block.hash)
+        difficulty_score = self.get_pow_difficulty(block)
+        return cp_score + difficulty_score
+
+    def is_checkpoint(self, block):
+        if block.header.number % self.config['EPOCH_LENGTH'] == 0:
+            return True
+        return False
+
+    def get_pow_head(self, checkpoint_hash):
+        try:
+            checkpoint_pow_head = self.db.get(b'cp_pow_head:' + checkpoint_hash)
+        except KeyError:
+            return None
+        return self.get_block(checkpoint_pow_head)
+
+    def recompute_head_checkpoint(self, candidate):
+        assert self.is_checkpoint(candidate) and self.is_checkpoint(self.head_checkpoint)
+        root = self.get_shared_parent_cp(self.head, candidate)
+        log.info('Head: {} - Candidate: {} - Root: {}'.format(self.head_checkpoint.number, candidate.number, root.number))
+        cp_head_hash = self.choose_head_checkpoint(root.hash)
+        log.info('Checkpoint head number: {}'.format(self.get_block(cp_head_hash).number))
+        self.checkpoint_head_hash = cp_head_hash
+
+    def find_heaviest_pow_block(self, root):
+        children = self.get_children(root)
+        maxchild, maxscore = root, self.get_pow_difficulty(root)
+        for c in children:
+            maxc, s = self.find_heaviest_pow_block(c)
+            if s > maxscore:
+                maxchild, maxscore = maxc, s
+        return maxchild, maxscore
+
+    def get_shared_parent_cp(self, b1, b2):
+        while self.get_prev_checkpoint_block(b1) != self.get_prev_checkpoint_block(b2):
+            log.info('Getting shared parent. b1: {} - b2: {}'.format(b1.header.number, b2.header.number))
+            if b1.header.number > b2.header.number:
+                b1 = self.get_prev_checkpoint_block(b1)
+            else:
+                b2 = self.get_prev_checkpoint_block(b2)
+        if self.get_prev_checkpoint_block(b1) is None:
+            return self.genesis
+        return self.get_prev_checkpoint_block(b1)
+
+    def choose_head_checkpoint(self, root_hash):
+        head = root_hash
+        while self.get_child_cp(head) is not None:
+            head = self.get_child_cp(head)
+            log.info('Getting child block num: {}'.format(self.get_block(head).number))
+        return head
+
+    def get_child_cp(self, checkpoint_hash):
+        try:
+            return self.db.get(b'cp_child' + checkpoint_hash)
+        except KeyError:
+            return None
+
+    # ~~~~~~~~~~~~~~~~~~~~ ADD BLOCK ~~~~~~~~~~~~~~~~~~~~ #
+
+    # This function should be called periodically so as to
+    # process blocks that were received but laid aside because
+    # they were received too early
+    def process_time_queue(self, new_time=None):
+        self.localtime = time.time() if new_time is None else new_time
+        i = 0
+        while i < len(self.time_queue) and self.time_queue[i].timestamp <= new_time:
+            log.info('Adding scheduled block')
+            pre_len = len(self.time_queue)
+            self.add_block(self.time_queue.pop(i))
+            if len(self.time_queue) == pre_len:
+                i += 1
+
+    def should_add_block(self, block):
+        # Check that the block wasn't recieved too early
+        now = self.localtime
+        if block.header.timestamp > now:
+            i = 0
+            while i < len(self.time_queue) and block.timestamp > self.time_queue[i].timestamp:
+                i += 1
+            self.time_queue.insert(i, block)
+            log.info('Block received too early (%d vs %d). Delaying for %d seconds' %
+                     (now, block.header.timestamp, block.header.timestamp - now))
+            return False
+        # Check that the block's parent has already been added
+        if block.header.prevhash not in self.env.db:
+            if block.header.prevhash not in self.parent_queue:
+                self.parent_queue[block.header.prevhash] = []
+            self.parent_queue[block.header.prevhash].append(block)
+            log.info('Got block %d (%s) with prevhash %s, parent not found. Delaying for now' %
+                     (block.number, encode_hex(block.hash), encode_hex(block.prevhash)))
+            return False
+        # Check that the block doesn't throw an exception
+        if block.header.prevhash == self.head_hash:
+            temp_state = self.state.ephemeral_clone()
+        else:
+            temp_state = self.mk_poststate_of_blockhash(block.header.prevhash)
+        try:
+            apply_block(temp_state, block)
+        except (AssertionError, KeyError, ValueError, InvalidTransaction, VerificationFailed) as e:  # FIXME add relevant exceptions here
+            log.info('Block %s with parent %s invalid, reason: %s' % (encode_hex(block.header.hash), encode_hex(block.header.prevhash), e))
+            return False
+        return True
+
+    def add_block_to_head(self, block):
+        log.info('Adding to head', head=encode_hex(block.header.prevhash))
+        apply_block(self.state, block)
+        self.db.put('block:' + str(block.header.number), block.header.hash)
+        self.get_pow_difficulty(block)  # side effect: put 'score:' cache in db
+        self.head_hash = block.header.hash
+        for i, tx in enumerate(block.transactions):
+            self.db.put(b'txindex:' + tx.hash, rlp.encode([block.number, i]))
+
+    def set_head(self, block):
+        # ~~~ PoW Fork Choice ~~~~ #
+        # If block is directly on top of the head, immediately make it our head
+        if block.header.prevhash == self.head_hash:
+            self.add_block_to_head(block)
+        else:  # Otherwise, check if we should change our head
+            # Here we should run `is_fork_heavier_than_head` but modify it so it works for both PoW and Casper... ODEE great
+            log.info('Receiving block not on head, adding to secondary post state',
+                     prevhash=encode_hex(block.header.prevhash))
+            self.reorganize_head_to(block)
+        self.db.put('head_hash', self.head_hash)
+        self.db.commit()
+        log.info('Reorganizing chain to block %d (%s) with %d txs and %d gas' %
+                 (block.header.number, encode_hex(block.header.hash)[:8],
+                  len(block.transactions), block.header.gas_used))
+        if self.new_head_cb and block.header.number != 0:
+            self.new_head_cb(block)
+        return True
+
+    # Call upon receiving a block
+    def add_block(self, block):
+        # ~~~ Validate ~~~~ #
+        # Validate that the block should be added
+        if not self.should_add_block(block):
+            return False
+        # ~~~ Store ~~~~ #
+        # Store the block
+        self.db.put(block.header.hash, rlp.encode(block))
+        self.add_child(block)
+        if block.number % self.config['EPOCH_LENGTH'] == 0:
+            self.db.put(b'cp_subtree_score' + block.hash, 0)
+        # Store the state root
+        if block.header.prevhash == self.head_hash:
+            temp_state = self.state.ephemeral_clone()
+        else:
+            temp_state = self.mk_poststate_of_blockhash(block.header.prevhash)
+        apply_block(temp_state, block)
+        self.db.put(b'state:' + block.header.hash, temp_state.trie.root_hash)
+        # ~~~ Finality Gadget Fork Choice ~~~~ #
+        old_head_chekpoint = self.head_checkpoint
+        for r in temp_state.receipts:
+            [self.casper_log_handler(l, block.header.hash) for l in r.logs]
+        # Store the block as its checkpoint child if is is heavier than the current child
+        cp = self.get_prev_checkpoint_block(block)
+        p_cp = cp
+        while cp is not self.genesis and self.get_checkpoint_score(cp.hash) == 0:
+            cp = self.get_prev_checkpoint_block(cp)
+        log.info('Recieved block. Block num: {} - Prev cp num: {} - Prev committed cp num: {} - P committed cp score: {}'.format(block.number, p_cp.number, cp.number, self.get_checkpoint_score(cp.hash)))
+        # Set a new head if required
+        log.info('Head cp num: {} - block prev cp num: {}'.format(self.head_checkpoint.number, cp.number))
+        if self.head_checkpoint == cp:
+            if self.head_checkpoint == old_head_chekpoint:
+                log.info('Head checkpoint == old head. CP Head Num: {} - Head diff: {} - Block diff: {}'.format(self.head_checkpoint.number, self.get_pow_difficulty(self.head), self.get_pow_difficulty(block)))
+                if self.get_pow_difficulty(self.head) < self.get_pow_difficulty(block):
+                    self.set_head(block)
+            else:
+                log.info('Head checkpoint changed to cp number: {}'.format(self.head_checkpoint.number))
+                new_head, _ = self.find_heaviest_pow_block(self.head_checkpoint)
+                self.set_head(new_head)
+        else:
+            log.info('Skipping block: Head checkpoint is not equal to cp!')
+        # Are there blocks that we received that were waiting for this block?
+        # If so, process them.
+        if block.header.hash in self.parent_queue:
+            for _blk in self.parent_queue[block.header.hash]:
+                self.add_block(_blk)
+            del self.parent_queue[block.header.hash]
+        return True
+
+    def reorganize_head_to(self, block):
+        log.info('Replacing head')
+        b = block
+        new_chain = {}
+        while b.header.number >= int(self.db.get('GENESIS_NUMBER')):
+            new_chain[b.header.number] = b
+            key = 'block:' + str(b.header.number)
+            orig_at_height = self.db.get(key) if key in self.db else None
+            if orig_at_height == b.header.hash:
+                break
+            if b.prevhash not in self.db or self.db.get(b.prevhash) == 'GENESIS':
+                break
+            b = self.get_parent(b)
+        replace_from = b.header.number
+        for i in itertools.count(replace_from):
+            log.info('Rewriting height %d' % i)
+            key = 'block:' + str(i)
+            orig_at_height = self.db.get(key) if key in self.db else None
+            if orig_at_height:
+                self.db.delete(key)
+                orig_block_at_height = self.get_block(orig_at_height)
+                for tx in orig_block_at_height.transactions:
+                    if b'txindex:' + tx.hash in self.db:
+                        self.db.delete(b'txindex:' + tx.hash)
+            if i in new_chain:
+                new_block_at_height = new_chain[i]
+                self.db.put(key, new_block_at_height.header.hash)
+                for i, tx in enumerate(new_block_at_height.transactions):
+                    self.db.put(b'txindex:' + tx.hash,
+                                rlp.encode([new_block_at_height.number, i]))
+            if i not in new_chain and not orig_at_height:
+                break
+        self.head_hash = block.header.hash
+        self.state = self.mk_poststate_of_blockhash(block.hash)
+
+    # ~~~~~~~~~~~~~~~~~~~~ CASPER UTILS ~~~~~~~~~~~~~~~~~~~~ #
 
     def get_decoded_commit(self, commit_rlp):
         commit_array = rlp.decode(commit_rlp)
@@ -149,63 +399,42 @@ class Chain(object):
         return commit
 
     def get_prev_checkpoint_block(self, block):
-        epoch_length = self.env.config['EPOCH_LENGTH']
-        checkpoint_distance = (block.header.number) % epoch_length
+        return self.get_block(self.get_prev_checkpoint_hash(block.hash))
+
+    def get_prev_checkpoint_hash(self, block_hash):
+        # Check if we already have the block in our cache
+        if b'prev_cp' + block_hash in self.db:
+            return self.db.get(b'prev_cp' + block_hash)
+        # Otherwise, compute the checkpoint
+        block = self.get_block(block_hash)
+        checkpoint_distance = (block.header.number) % self.config['EPOCH_LENGTH']
         if checkpoint_distance == 0:
-            checkpoint_distance = epoch_length
+            checkpoint_distance = self.config['EPOCH_LENGTH']
+        b = block
         for i in range(checkpoint_distance):
-            if block.header.prevhash == b'\x00' * 32:
-                return block
-            block = self.get_block(block.header.prevhash)
-        return block
+            if b'prev_cp' + b.hash in self.db:
+                prev_checkpoint_hash = self.db.get(b'prev_cp' + b.hash)
+                self.db.put(b'prev_cp' + block.hash, prev_checkpoint_hash)
+                return prev_checkpoint_hash
+            b = self.get_block(b.header.prevhash)
+            if b is None:
+                raise Exception('No prev checkpoint')
+        self.db.put(b'prev_cp' + block.hash, b.hash)
+        return b.hash
 
     def is_parent_checkpoint(self, parent, child):
+        if parent == b'\x00' * 32:
+            # If the parent checkpoint is the genesis checkpoint, then the child must be a decedent
+            return True
         parent_block = self.get_block(parent)
         child_block = self.get_block(child)
-        while parent_block.header.number > child_block.header.number:
-            parent_block = self.get_prev_checkpoint_block(parent_block)
+        while parent_block.header.number < child_block.header.number:
+            log.info('child block num: {}'.format(child_block.header.number))
+            child_block = self.get_prev_checkpoint_block(child_block)
         if parent_block == child_block:
             return True
         else:
             return False
-
-    def maybe_update_checkpoint_head_hash(self, fork_hash):
-        # If our checkpoint head is the initial head hash value, immediately use the fork hash
-        if self.checkpoint_head_hash == b'\x00' * 32:
-            self.checkpoint_head_hash = fork_hash
-            return
-        # Check that the fork isn't a direct decendent of head
-        if self.is_parent_checkpoint(self.checkpoint_head_hash, fork_hash):
-            return
-        # Check that the fork is heavier than the head
-        if not self.is_fork_commits_heavier_than_head(self.checkpoint_head_hash, fork_hash):
-            return
-        self.checkpoint_head_hash = fork_hash
-        # Set the head_hash to equal the latest block known for our checkpoint
-        try:
-            self.head_hash = self.db.get(b'cp_head_hash:' + self.checkpoint_head_hash)
-        except KeyError:
-            self.head_hash = fork_hash
-        log.info('Update checkpoint to: {} - Update head to: {}'.format(utils.encode_hex(fork_hash), utils.encode_hex(self.head_hash)))
-
-    def is_fork_commits_heavier_than_head(self, head_hash, fork_hash):
-        # Get the related blocks
-        hc = self.get_block(head_hash)
-        fc = self.get_block(fork_hash)
-        # Calculate the score for the fork checkpoint
-        fork_score = self.get_checkpoint_score(fc.header.hash)
-        # Loop over the hc & fc until they are equal (we find a shared parent)
-        while fc != hc:
-            if fc.header.number > hc.header.number:
-                fc = self.get_prev_checkpoint_block(fc)
-                continue
-            head_score = self.get_checkpoint_score(hc.header.hash)
-            # If the fork score is lower than the head at any point, return False
-            if fork_score < head_score:
-                return False
-            hc = self.get_prev_checkpoint_block(hc)
-        # We've compared the fork score to all head scores, and so return True
-        return True
 
     def get_checkpoint_score(self, checkpoint_hash):
         try:
@@ -221,7 +450,9 @@ class Chain(object):
             curr_dyn_deposits += utils.big_endian_to_int(d[32:])
         prev_dyn_score = prev_dyn_deposits / prev_dyn_total_deposits if prev_dyn_total_deposits > 0 else 1
         curr_dyn_score = curr_dyn_deposits / curr_dyn_total_deposits if curr_dyn_total_deposits > 0 else 1
-        return min(prev_dyn_score, curr_dyn_score)
+        return min(min(prev_dyn_score, curr_dyn_score), 2/3.)
+
+    # ~~~~~~~~~~~~~~~~~~~~ BLOCK UTILS ~~~~~~~~~~~~~~~~~~~~ #
 
     def mk_poststate_of_blockhash(self, blockhash, convert=False):
         if blockhash not in self.db:
@@ -323,11 +554,10 @@ class Chain(object):
         return [self.get_block(h) for h in self.get_child_hashes(block)]
 
     # Get the score (AKA total difficulty in PoW) of a given block
-    def get_score(self, block):
+    def get_pow_difficulty(self, block):
         if not block:
             return 0
         key = b'score:' + block.header.hash
-
         fills = []
         while key not in self.db:
             fills.insert(0, (block.header.hash, block.difficulty))
@@ -340,151 +570,7 @@ class Chain(object):
             key = b'score:' + h
             score = score + d + random.randrange(d // 10**6 + 1)
             self.db.put(key, str(score))
-
         return score
-
-    # These two functions should be called periodically so as to
-    # process blocks that were received but laid aside because
-    # either the parent was missing or they were received
-    # too early
-    def process_time_queue(self, new_time=None):
-        self.localtime = time.time() if new_time is None else new_time
-        i = 0
-        while i < len(self.time_queue) and self.time_queue[i].timestamp <= new_time:
-            log.info('Adding scheduled block')
-            pre_len = len(self.time_queue)
-            self.add_block(self.time_queue.pop(i))
-            if len(self.time_queue) == pre_len:
-                i += 1
-
-    def process_parent_queue(self):
-        deletions = []
-        for parent_hash, blocks in self.parent_queue.items():
-            if parent_hash in self.db:
-                for block in blocks:
-                    self.add_block(block)
-                deletions.append(parent_hash)
-        for parent_hash in deletions:
-            del self.parent_queue[parent_hash]
-
-    # Call upon receiving a block
-    def add_block(self, block):
-        now = self.localtime
-        if block.header.timestamp > now:
-            i = 0
-            while i < len(self.time_queue) and block.timestamp > self.time_queue[i].timestamp:
-                i += 1
-            self.time_queue.insert(i, block)
-            log.info('Block received too early (%d vs %d). Delaying for %d seconds' %
-                     (now, block.header.timestamp, block.header.timestamp - now))
-            return False
-        # Check what the current checkpoint head should be
-        if block.header.number > int(self.db.get('GENESIS_NUMBER')) + 1 and block.header.prevhash in self.env.db:
-            temp_state = self.mk_poststate_of_blockhash(block.header.prevhash)
-            try:
-                apply_block(temp_state, block)
-            except (KeyError, ValueError) as e:  # FIXME add relevant exceptions here
-                log.info('Block %s with parent %s invalid, reason: %s' % (encode_hex(block.header.hash), encode_hex(block.header.prevhash), e))
-                return False
-            self.db.put(b'state:' + block.header.hash, temp_state.trie.root_hash)
-            # Check to see if we need to update the checkpoint_head
-            for r in temp_state.receipts:
-                [self.casper_log_handler(l, temp_state, block.header.hash) for l in r.logs]
-        if block.header.prevhash == self.head_hash:
-            log.info('Adding to head', head=encode_hex(block.header.prevhash))
-            try:
-                apply_block(self.state, block)
-            except (AssertionError, KeyError, ValueError, InvalidTransaction, VerificationFailed) as e:  # FIXME add relevant exceptions here
-                log.info('Block %s with parent %s invalid, reason: %s' % (encode_hex(block.header.hash), encode_hex(block.header.prevhash), e))
-                return False
-            self.db.put('block:' + str(block.header.number), block.header.hash)
-            self.db.put(b'state:' + block.header.hash, self.state.trie.root_hash)
-            block_score = self.get_score(block)  # side effect: put 'score:' cache in db
-            self.head_hash = block.header.hash
-            for i, tx in enumerate(block.transactions):
-                self.db.put(b'txindex:' + tx.hash, rlp.encode([block.number, i]))
-        elif block.header.prevhash in self.env.db:
-            log.info('Receiving block not on head, adding to secondary post state',
-                     prevhash=encode_hex(block.header.prevhash))
-            temp_state = self.mk_poststate_of_blockhash(block.header.prevhash)
-            try:
-                apply_block(temp_state, block)
-            except (AssertionError, KeyError, ValueError, InvalidTransaction, VerificationFailed) as e:  # FIXME add relevant exceptions here
-                log.info('Block %s with parent %s invalid, reason: %s' % (encode_hex(block.header.hash), encode_hex(block.header.prevhash), e))
-                return False
-            self.db.put(b'state:' + block.header.hash, temp_state.trie.root_hash)
-            block_score = self.get_score(block)
-            # Get the checkpoint in the fork with the same block number as our head checkpoint, if they are equal, the block is a child
-            # TODO: Clean up this logic--it's super ugly
-            fork_cp_block = self.get_prev_checkpoint_block(block)
-            head_cp_block = self.get_block(self.checkpoint_head_hash) if self.checkpoint_head_hash != b'\x00'*32 else fork_cp_block
-            while(fork_cp_block.header.number > head_cp_block.header.number):
-                fork_cp_block = self.get_prev_checkpoint_block(fork_cp_block)
-            # Replace the head only if the fork block is a child of the head checkpoint
-            if (head_cp_block.hash == fork_cp_block.hash and block_score > self.get_score(self.head)):
-                log.info('Replacing head')
-                b = block
-                new_chain = {}
-                while b.header.number >= int(self.db.get('GENESIS_NUMBER')):
-                    new_chain[b.header.number] = b
-                    key = 'block:' + str(b.header.number)
-                    orig_at_height = self.db.get(key) if key in self.db else None
-                    if orig_at_height == b.header.hash:
-                        break
-                    if b.prevhash not in self.db or self.db.get(b.prevhash) == 'GENESIS':
-                        break
-                    b = self.get_parent(b)
-                replace_from = b.header.number
-                for i in itertools.count(replace_from):
-                    log.info('Rewriting height %d' % i)
-                    key = 'block:' + str(i)
-                    orig_at_height = self.db.get(key) if key in self.db else None
-                    if orig_at_height:
-                        self.db.delete(key)
-                        orig_block_at_height = self.get_block(orig_at_height)
-                        for tx in orig_block_at_height.transactions:
-                            if b'txindex:' + tx.hash in self.db:
-                                self.db.delete(b'txindex:' + tx.hash)
-                    if i in new_chain:
-                        new_block_at_height = new_chain[i]
-                        self.db.put(key, new_block_at_height.header.hash)
-                        for i, tx in enumerate(new_block_at_height.transactions):
-                            self.db.put(b'txindex:' + tx.hash,
-                                        rlp.encode([new_block_at_height.number, i]))
-                    if i not in new_chain and not orig_at_height:
-                        break
-                self.head_hash = block.header.hash
-                self.state = temp_state
-        else:
-            if block.header.prevhash not in self.parent_queue:
-                self.parent_queue[block.header.prevhash] = []
-            self.parent_queue[block.header.prevhash].append(block)
-            log.info('No parent found. Delaying for now')
-            return False
-        self.add_child(block)
-        self.db.put('head_hash', self.head_hash)
-        self.db.put(b'cp_head_hash:' + self.checkpoint_head_hash, self.head_hash)
-        self.db.put(block.header.hash, rlp.encode(block))
-        self.db.commit()
-        log.info('Added block %d (%s) with %d txs and %d gas' % \
-            (block.header.number, encode_hex(block.header.hash)[:8],
-             len(block.transactions), block.header.gas_used))
-        if self.new_head_cb and block.header.number != 0:
-            self.new_head_cb(block)
-        return True
-
-    def __contains__(self, blk):
-        if isinstance(blk, (str, bytes)):
-            try:
-                blk = rlp.decode(self.db.get(blk), Block)
-            except:
-                return False
-        try:
-            o = self.get_block(self.get_blockhash_by_number(blk.number)).hash
-            assert o == blk.hash
-            return True
-        except:
-            return False
 
     def has_block(self, block):
         return block in self
@@ -524,28 +610,42 @@ class Chain(object):
             output.append(b)
         return output
 
-    @property
-    def db(self):
-        return self.env.db
-
+    # Get blockhashes starting from a hash and going backwards
     def get_blockhashes_from_hash(self, hash, max):
-        try:
-            header = blocks.get_block_header(self.db, hash)
-        except KeyError:
+        block = self.get_block(hash)
+        if block is None:
             return []
 
+        header = block.header
         hashes = []
         for i in xrange(max):
             hash = header.prevhash
-            try:
-                header = blocks.get_block_header(self.db, hash)
-            except KeyError:
+            block = self.get_block(hash)
+            if block is None:
                 break
-            hashes.append(hash)
+            header = block.header
+            hashes.append(header.hash)
             if header.number == 0:
                 break
         return hashes
 
+    def __contains__(self, blk):
+        if isinstance(blk, (str, bytes)):
+            try:
+                blk = rlp.decode(self.db.get(blk), Block)
+            except:
+                return False
+        try:
+            o = self.get_block(self.get_blockhash_by_number(blk.number)).hash
+            assert o == blk.hash
+            return True
+        except:
+            return False
+
     @property
     def config(self):
         return self.env.config
+
+    @property
+    def db(self):
+        return self.env.db
