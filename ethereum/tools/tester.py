@@ -4,7 +4,7 @@ from ethereum.transactions import Transaction
 from ethereum.consensus_strategy import get_consensus_strategy
 from ethereum.config import config_homestead, config_tangerine, config_spurious, config_metropolis, default_config, Env
 from ethereum.pow.ethpow import Miner
-from ethereum.messages import apply_transaction, apply_message
+from ethereum.messages import _apply_transaction, apply_message
 from ethereum.common import verify_execution_results, mk_block_from_prevstate, set_execution_results
 from ethereum.meta import make_head_candidate
 from ethereum.abi import ContractTranslator
@@ -179,7 +179,7 @@ class Chain(object):
         if self.last_sender is not None and privtoaddr(
                 self.last_sender) != transaction.sender:
             self.last_sender = None
-        success, output = apply_transaction(self.head_state, transaction)
+        success, output = _apply_transaction(self.head_state, transaction)
         self.block.transactions.append(transaction)
         if not success:
             raise TransactionFailed()
@@ -198,6 +198,15 @@ class Chain(object):
             transaction.nonce = 0
         else:
             transaction.sign(sender)
+        output = self.direct_tx(transaction)
+        return output
+
+    def _tx(self, sender=k0, to=b'\x00' * 20, value=0,
+           data=b'', startgas=STARTGAS, gasprice=GASPRICE):
+        sender_addr = privtoaddr(sender)
+        self.last_sender = sender
+        transaction = Transaction(self.head_state.get_nonce(sender_addr), gasprice, startgas,
+                                  to, value, data).sign(sender)
         output = self.direct_tx(transaction)
         return output
 
